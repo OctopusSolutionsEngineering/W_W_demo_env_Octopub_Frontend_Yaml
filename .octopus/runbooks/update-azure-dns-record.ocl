@@ -1,0 +1,166 @@
+name = "Update Azure DNS record"
+default_guided_failure_mode = "EnvironmentDefault"
+description = "Update DNS record in Azure (works for both Azure and AWS)"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+}
+
+process {
+    step "get-ingress-loadbalancer-external-ip" {
+        name = "Get Ingress LoadBalancer External IP"
+        properties = {
+            Octopus.Action.TargetRoles = "demo-k8s-cluster"
+        }
+
+        action {
+            action_type = "Octopus.KubernetesRunScript"
+            properties = {
+                Octopus.Action.RunOnServer = "true"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    # Get ingresses for namespace
+                    $ingresses = (kubectl get ingresses -n $OctopusParameters["Octopub.Yaml.Cluster.Namespace"] -o json | ConvertFrom-Json)
+                    $ingress = $ingresses.items[0].status.loadBalancer.ingress
+                    
+                    if (![string]::IsNullOrWhitespace($ingress.ip))
+                    {
+                    	Write-Host "The IP is $($ingress.ip)"
+                    	Set-OctopusVariable -name "ExternalIp" -value $ingress.ip
+                    }
+                    else
+                    {
+                    	Write-Host "The LoadBalancer URL is $($ingress.hostname)"
+                    	Set-OctopusVariable -name "LoadBalancerUrl" -value $ingress.hostname
+                    }
+                    
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool_variable = ""
+        }
+    }
+
+    step "get-ip" {
+        name = "Get IP"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    # Declare local variables
+                    $loadBalancerUrl = $OctopusParameters['Octopus.Action[Get Ingress LoadBalancer External IP].Output.LoadBalancerUrl']
+                    
+                    # Check to see if we need to resolve the url
+                    if (![string]::IsNullOrWhitespace($loadBalancerUrl))
+                    {
+                    	# Get the IP addresses
+                        $ipAddress = [System.Net.Dns]::GetHostAddresses($loadBalancerUrl).IPAddressToString
+                        
+                        # Check to see if there was an array returned
+                        if ($ipAddress -is [array])
+                        {
+                        	# Just grab the first one
+                            Set-OctopusVariable -name "ExternalIp" -value $ipAddress[0]
+                        }
+                        else
+                        {
+                        	Set-OctopusVariable -name "ExternalIp" -value $ipAddress
+                        }
+                    }
+                    else
+                    {
+                    	# Set it to previous output variable
+                        Set-OctopusVariable -name "ExternalIp" -value "#{Octopus.Action[Get Ingress LoadBalancer External IP].Output.ExternalIp}"
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool = "hosted-ubuntu"
+        }
+    }
+
+    step "update-dns-recordset" {
+        name = "Update DNS recordset"
+
+        action {
+            action_type = "Octopus.AzurePowerShell"
+            properties = {
+                Octopus.Action.Azure.AccountId = "demo-octopus-app"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    Function Update-Dns-Record
+                    {
+                    	# Define parameters
+                        param(
+                        	$DnsRecords,
+                            $HostName,
+                            $IPAddress
+                        )
+                        
+                        # Get the records associated with the environment
+                        $environmentRecords = ($DnsRecords | Where-Object {$_.fqdn.Contains($Hostname.ToLower())})
+                        
+                        # Loop through the records
+                        foreach ($record in $environmentRecords)
+                        {
+                            # Compare addresses
+                            if ($record.ARecords[0].ipv4Address -ne $IPAddress)
+                            {
+                            	Write-Host "Updating DNS record $($record.fqdn) from $($record.ARecords[0].ipv4Address) to $IPAddress"
+                                
+                                if ($null -ne $record.ARecords[0].ipv4Address)
+                                {
+                                	az network dns record-set a remove-record --resource-group $resourceGroup --zone-name $zoneName --record-set-name $record.name --ipv4-address $record.ARecords[0].ipv4Address
+                                }
+                                
+                                az network dns record-set a add-record --resource-group $resourceGroup --zone-name $zoneName --record-set-name $record.name --ipv4-address $IPAddress
+                                
+                                
+                            }
+                            else
+                            {
+                            	Write-Host "$Hostname already set to $IPAddress."
+                            }
+                        }
+                    }
+                    
+                    # Declare working variables
+                    $resourceGroup = "octopus-shared-resources"
+                    $zoneName = "octopussamples.com"
+                    $cleanedSpaceName = $OctopusParameters['Octopub.Yaml.CleanedSpaceName']
+                    
+                    # Get list of DNS entries
+                    Write-Host "Getting list of DNS records ..."
+                    $dnsRecords = ((az network dns record-set list --resource-group $resourceGroup --zone-name $zoneName) | ConvertFrom-Json)
+                    
+                    #$projectDnsRecords = ($dnsRecords | Where-Object {$_.fqdn.Contains($cleanedSpaceName)})
+                    $dnsRecordName = "octopub-$($cleanedSpaceName).$($OctopusParameters['Octopus.Environment.Name'].ToLower())"
+                    
+                    #$projectDnsRecords = ($dnsRecords | Where-Object {$_.name.Contains($dnsRecordName)})
+                    $projectDnsRecords = ($dnsRecords | Where-Object {$_.name -eq ($dnsRecordName)})
+                    
+                    if ($null -ne $projectDnsRecords)
+                    {
+                    	Write-Host "Updating $dnsRecordName with #{Octopus.Action[Get IP].Output.ExternalIp}"
+                        Update-Dns-Record -DnsRecords $projectDnsRecords -Hostname "octopub.$cleanedSpaceName" -IPAddress "#{Octopus.Action[Get IP].Output.ExternalIp}"
+                    }
+                    else
+                    {
+                    	Write-Host "No record found to update."
+                    }
+                    
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool = "azure-worker-pool"
+        }
+    }
+}
