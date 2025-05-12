@@ -148,7 +148,7 @@ process {
                     if ($null -ne $projectDnsRecords)
                     {
                     	Write-Host "Updating $dnsRecordName with #{Octopus.Action[Get IP].Output.ExternalIp}"
-                        Update-Dns-Record -DnsRecords $projectDnsRecords -Hostname "octopub.$cleanedSpaceName" -IPAddress "#{Octopus.Action[Get IP].Output.ExternalIp}"
+                        Update-Dns-Record -DnsRecords $projectDnsRecords -Hostname "octopub-$cleanedSpaceName" -IPAddress "#{Octopus.Action[Get IP].Output.ExternalIp}"
                     }
                     else
                     {
